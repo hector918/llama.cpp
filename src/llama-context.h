@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-h2o.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -75,6 +76,8 @@ struct llama_context {
     uint32_t n_threads_batch() const;
 
     llama_memory_t get_memory() const;
+
+    llama_h2o * get_h2o() const { return h2o.get(); }
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
@@ -345,6 +348,9 @@ private:
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
+
+    std::unique_ptr<llama_h2o> h2o; // 空 = 关闭
+    std::vector<float> h2o_buf;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};

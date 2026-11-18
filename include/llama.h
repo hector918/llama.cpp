@@ -399,6 +399,8 @@ extern "C" {
         size_t moe_cache_size;      // device cache in bytes for the experts kept in host memory, split among the devices like the layers, 0 = disabled [EXPERIMENTAL]
         float  moe_cache_cpu_share; // share of the MoE cache misses computed on the CPU instead of uploaded, 0 = all uploaded [EXPERIMENTAL]
 
+        uint32_t h2o_budget;        // H2O: positions kept per (full-attention layer, KV head), 0 = disabled [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -1088,6 +1090,23 @@ extern "C" {
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
+
+    // H2O-style KV retention, mask mode [EXPERIMENTAL]
+    // Enabled with llama_context_params.h2o_budget > 0 (forces the explicit softmax attention path).
+    // Single sequence, append-only. See src/llama-h2o.h
+#define LLAMA_H2O_API 1
+    // accumulate the attention weights of the decoded tokens (default: true)
+    LLAMA_API void    llama_h2o_set_accumulate(struct llama_context * ctx, bool accumulate);
+    // apply the eviction rule to every (layer, KV head); returns the number of newly evicted entries, -1 if disabled
+    LLAMA_API int32_t llama_h2o_evict(struct llama_context * ctx);
+    // number of layers tracked (known after the first decode)
+    LLAMA_API int32_t llama_h2o_n_layers(const struct llama_context * ctx);
+    // model layer index of the i-th tracked layer
+    LLAMA_API int32_t llama_h2o_layer(const struct llama_context * ctx, int32_t i);
+    LLAMA_API int32_t llama_h2o_n_head_kv(const struct llama_context * ctx);
+    // kept positions (ascending) of a (model layer, KV head); writes up to cap entries, returns the total count
+    LLAMA_API int32_t llama_h2o_get_keep(const struct llama_context * ctx, int32_t il, int32_t head_kv, int32_t * out, int32_t cap);
+    LLAMA_API void    llama_h2o_reset(struct llama_context * ctx);
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens

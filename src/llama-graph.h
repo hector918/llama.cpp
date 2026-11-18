@@ -24,6 +24,7 @@ struct llama_prec_policy;
 struct llama_hadamard;
 
 class llama_moe_cache;
+struct llama_h2o;
 
 struct llama_memory_context_i;
 
@@ -340,6 +341,22 @@ struct llm_attn_mask {
 
     // fill every token of a sequence with the mask row of its first token (dspark draft blocks)
     bool block_uniform = false;
+};
+
+// H2O:每个全注意力层一张按头的加性掩码 [n_kv, 1, n_head, 1]
+class llm_graph_input_h2o : public llm_graph_input_i {
+public:
+    llm_graph_input_h2o(llama_h2o * h2o, bool with_acc) : h2o(h2o), with_acc(with_acc) {}
+    virtual ~llm_graph_input_h2o() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    std::vector<std::pair<int, ggml_tensor *>> masks; // (层号, F32 [n_kv, 1, n_head, 1])
+
+    llama_h2o * h2o;
+    bool with_acc; // 建图时是否带累计输出
 };
 
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
@@ -805,6 +822,8 @@ struct llm_graph_params {
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
 
+    llama_h2o * h2o = nullptr; // H2O 保留表(关闭时为空)
+
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
@@ -986,6 +1005,10 @@ public:
 
     std::vector<ggml_tensor *> t_sampling_all;
 
+    // H2O:各全注意力层的累计输出 (层号, F32 [1, n_kv, n_head, 1]) 与掩码输入
+    std::vector<std::pair<int, ggml_tensor *>> t_h2o_acc;
+    llm_graph_input_h2o * inp_h2o = nullptr;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1082,6 +1105,8 @@ struct llm_graph_context {
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
     const llama_moe_cache        * moe_cache;
+
+    llama_h2o * h2o;
 
     const llama_prec_policy * prec_policy;
 

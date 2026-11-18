@@ -322,6 +322,16 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    if (params.h2o_budget > 0) {
+        // H2O 要拿 softmax 后的权重、要按头加掩码:走显式 softmax
+        LLAMA_LOG_INFO("%s: h2o_budget = %u, flash attention disabled\n", __func__, params.h2o_budget);
+        cparams.flash_attn = false;
+        cparams.auto_fa    = false;
+
+        h2o = std::make_unique<llama_h2o>();
+        h2o->budget = params.h2o_budget;
+    }
+
     // the KV cache is shared with ctx_other, so follow its flash attention setting instead of resolving it here:
     // the probe disables it when the layers and the shared KV are on different devices, which breaks a quantized V cache
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
@@ -2402,6 +2412,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
 
+        if (h2o) {
+            // H2O:读走各全注意力层本 ubatch 的累计量
+            ggml_backend_sched_synchronize(sched.get());
+            for (const auto & [il, t] : res->t_h2o_acc) {
+                h2o_buf.resize(ggml_nelements(t));
+                ggml_backend_tensor_get(t, h2o_buf.data(), 0, ggml_nbytes(t));
+
+                h2o->add_acc(il, h2o_buf.data(), t->ne[1], t->ne[2]);
+            }
+
+            h2o->n_pos += ubatch.n_tokens;
+        }
+
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
@@ -3088,6 +3111,7 @@ llm_graph_params llama_context::graph_params(
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.moe_cache   =*/ moe_cache.get(),
+        /*.h2o         =*/ h2o.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
         /*.layer_inp_dev =*/ layer_inp_dev,
@@ -4441,6 +4465,7 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.moe_cache_size              =*/ 0,
         /*.moe_cache_cpu_share         =*/ 0.0f,
+        /*.h2o_budget                  =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
@@ -4668,6 +4693,53 @@ void llama_set_abort_callback(llama_context * ctx, bool (*abort_callback)(void *
 
 void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
+}
+
+void llama_h2o_set_accumulate(llama_context * ctx, bool accumulate) {
+    if (auto * h2o = ctx->get_h2o()) {
+        h2o->accumulate = accumulate;
+    }
+}
+
+int32_t llama_h2o_evict(llama_context * ctx) {
+    auto * h2o = ctx->get_h2o();
+    return h2o ? (int32_t) h2o->evict() : -1;
+}
+
+int32_t llama_h2o_n_layers(const llama_context * ctx) {
+    const auto * h2o = ctx->get_h2o();
+    return h2o ? (int32_t) h2o->layers.size() : 0;
+}
+
+int32_t llama_h2o_layer(const llama_context * ctx, int32_t i) {
+    const auto * h2o = ctx->get_h2o();
+    if (!h2o || i < 0 || i >= (int32_t) h2o->layers.size()) {
+        return -1;
+    }
+    return std::next(h2o->layers.begin(), i)->first;
+}
+
+int32_t llama_h2o_n_head_kv(const llama_context * ctx) {
+    const auto * h2o = ctx->get_h2o();
+    return h2o ? (int32_t) h2o->n_head_kv : 0;
+}
+
+int32_t llama_h2o_get_keep(const llama_context * ctx, int32_t il, int32_t head_kv, int32_t * out, int32_t cap) {
+    const auto * h2o = ctx->get_h2o();
+    if (!h2o) {
+        return -1;
+    }
+    const auto keep = h2o->keep(il, head_kv);
+    for (int32_t i = 0; i < cap && i < (int32_t) keep.size(); ++i) {
+        out[i] = keep[i];
+    }
+    return (int32_t) keep.size();
+}
+
+void llama_h2o_reset(llama_context * ctx) {
+    if (auto * h2o = ctx->get_h2o()) {
+        h2o->reset();
+    }
 }
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {

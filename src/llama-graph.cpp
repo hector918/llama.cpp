@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "llama-h2o.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -1203,6 +1205,20 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_h2o::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    for (auto & [il, t] : masks) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+        h2o->fill_mask(il, (float *) t->data, t->ne[0], t->ne[2]);
+    }
+}
+
+bool llm_graph_input_h2o::can_reuse(const llm_graph_params & params) {
+    // n_kv 由同一张图里注意力输入的 can_reuse 把关
+    return params.h2o == h2o && h2o->accumulate == with_acc;
+}
+
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);
@@ -1434,6 +1450,9 @@ void llm_graph_result::reset() {
     t_candidates.clear();
     t_sampling_all.clear();
 
+    t_h2o_acc.clear();
+    inp_h2o = nullptr;
+
     params = {};
 
     inputs.clear();
@@ -1590,6 +1609,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     moe_cache        (params.moe_cache),
+    h2o              (params.h2o),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     layer_inp_dev    (params.layer_inp_dev),
@@ -3180,9 +3200,40 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cb(kq, "kq_plus_kq_b", il);
         }
 
+        const bool use_h2o = h2o != nullptr && h2o->budget > 0;
+
+        if (use_h2o) {
+            // 按层按头的保留表:淘汰位加 -inf(kq: [n_kv, n_tokens, n_head, 1])
+            GGML_ASSERT(kq->ne[3] == 1 && "H2O: single stream only");
+
+            h2o->touch(il, k->ne[2]);
+
+            if (res->inp_h2o == nullptr) {
+                auto inp = std::make_unique<llm_graph_input_h2o>(h2o, h2o->accumulate);
+                res->inp_h2o = (llm_graph_input_h2o *) res->add_input(std::move(inp));
+            }
+
+            ggml_tensor * h2o_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, kq->ne[0], 1, kq->ne[2], 1);
+            ggml_set_input(h2o_mask);
+            ggml_format_name(h2o_mask, "h2o_mask_l%d", il);
+            res->inp_h2o->masks.push_back({il, h2o_mask});
+
+            kq = ggml_add(ctx0, kq, h2o_mask);
+            cb(kq, "kq_h2o_masked", il);
+        }
+
         kq = ggml_soft_max_ext(ctx0, kq, kq_mask, kq_scale, hparams.f_max_alibi_bias);
         ggml_soft_max_add_sinks(kq, sinks);
         cb(kq, "kq_soft_max", il);
+
+        if (use_h2o && res->inp_h2o->with_acc) {
+            // softmax 后权重沿查询维求和 -> [1, n_kv, n_head, 1],算完由 llama_context::decode 读走
+            ggml_tensor * acc = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, kq, 1, 0, 2, 3)));
+            ggml_format_name(acc, "h2o_acc_l%d", il);
+            ggml_set_output(acc);
+            ggml_build_forward_expand(gf, acc);
+            res->t_h2o_acc.push_back({il, acc});
+        }
 
         if (!v_trans) {
             // note: avoid this branch
